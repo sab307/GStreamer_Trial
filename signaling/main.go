@@ -4,11 +4,21 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// extractIP gets the IP portion from a "host:port" or "[host]:port" string.
+func extractIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -41,6 +51,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Server] New %s connection: %s (from %s)", role, id, r.RemoteAddr)
 
 	client := NewClient(hub, conn, id, role)
+	// Extract IP from RemoteAddr (format "ip:port" or "[ipv6]:port")
+	client.RemoteIP = extractIP(r.RemoteAddr)
 
 	// Auto-register receivers immediately
 	if role == "receiver" {

@@ -4,9 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
+
+// mDNS UUID pattern: Chrome hides real IPs behind UUIDs like
+// "a0defc08-459e-4a10-8444-..." for privacy. On machines without
+// avahi/nss-mdns, GStreamer's libnice cannot resolve these,
+// causing ICE to fail even on localhost.
+var mdnsPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.local)?$`)
 
 // Message represents a signaling message.
 type Message struct {
@@ -19,6 +27,9 @@ type Message struct {
 	Role          string      `json:"role,omitempty"`
 	ID            interface{} `json:"id,omitempty"`
 	Streams       []string    `json:"streams,omitempty"`
+
+	// ICE server configuration (STUN/TURN) - sent from sender to receivers
+	IceServers json.RawMessage `json:"ice_servers,omitempty"`
 
 	// Clock sync fields
 	T1 float64 `json:"t1,omitempty"`
@@ -71,12 +82,13 @@ func (h *Hub) RegisterClient(client *Client) {
 		h.senders[client.ID] = client
 		log.Printf("[Hub] Sender registered: %s", client.ID)
 
-		// Notify all receivers that a sender joined
+		// Notify all receivers that a sender joined (include ICE servers)
 		for _, recv := range h.receivers {
 			msg := Message{
-				Type:     "sender_joined",
-				SenderID: client.ID,
-				Streams:  client.Streams,
+				Type:       "sender_joined",
+				SenderID:   client.ID,
+				Streams:    client.Streams,
+				IceServers: client.IceServers,
 			}
 			data, _ := json.Marshal(msg)
 			recv.Send(data)
@@ -95,12 +107,13 @@ func (h *Hub) RegisterClient(client *Client) {
 			sender.Send(data)
 		}
 
-		// Send existing sender info to the new receiver
+		// Send existing sender info to the new receiver (include ICE servers)
 		for senderID, sender := range h.senders {
 			msg := Message{
-				Type:     "sender_joined",
-				SenderID: senderID,
-				Streams:  sender.Streams,
+				Type:       "sender_joined",
+				SenderID:   senderID,
+				Streams:    sender.Streams,
+				IceServers: sender.IceServers,
 			}
 			data, _ := json.Marshal(msg)
 			client.Send(data)
@@ -129,6 +142,16 @@ func (h *Hub) UnregisterClient(client *Client) {
 	} else {
 		delete(h.receivers, client.ID)
 		log.Printf("[Hub] Receiver disconnected: %s", client.ID)
+
+		// Notify all senders that this receiver left
+		for _, sender := range h.senders {
+			msg := Message{
+				Type: "receiver_left",
+				ID:   client.ID,
+			}
+			data, _ := json.Marshal(msg)
+			sender.Send(data)
+		}
 	}
 }
 
@@ -143,6 +166,9 @@ func (h *Hub) RouteMessage(from *Client, rawMsg []byte) {
 	switch msg.Type {
 	case "register":
 		from.Streams = msg.Streams
+		if msg.IceServers != nil {
+			from.IceServers = msg.IceServers
+		}
 		h.RegisterClient(from)
 
 	case "offer":
@@ -157,7 +183,12 @@ func (h *Hub) RouteMessage(from *Client, rawMsg []byte) {
 		if from.Role == "sender" {
 			h.routeToReceivers(rawMsg)
 		} else {
-			h.routeToSender(msg.SenderID, rawMsg)
+			// Replace mDNS addresses in browser ICE candidates with real IP.
+			// Chrome hides local IPs behind mDNS UUIDs for privacy.
+			// GStreamer's libnice can't resolve mDNS without avahi-daemon,
+			// causing ICE to fail even on localhost.
+			replaced := h.replaceMdnsCandidate(from, rawMsg)
+			h.routeToSender(msg.SenderID, replaced)
 		}
 
 	case "clock_sync_request":
@@ -221,4 +252,65 @@ func (h *Hub) routeToSender(senderID string, rawMsg []byte) {
 	} else {
 		log.Printf("[Hub] Sender not found: %s", senderID)
 	}
+}
+
+// replaceMdnsCandidate checks if an ICE candidate message contains an mDNS
+// address and replaces it with the client's real IP from the WebSocket connection.
+//
+// Chrome hides local IPs behind mDNS UUIDs (e.g. "a0defc08-459e-4a10-8444-...")
+// for privacy. GStreamer's libnice cannot resolve mDNS without avahi-daemon,
+// so ICE fails even on localhost. The signaling server knows the real IP from
+// the WebSocket TCP connection, so it can perform the replacement transparently.
+//
+// ICE candidate format:
+//
+//	candidate:<foundation> <component> <protocol> <priority> <ADDRESS> <port> typ <type> ...
+//	Field index:                                               4         5
+func (h *Hub) replaceMdnsCandidate(from *Client, rawMsg []byte) []byte {
+	if from.RemoteIP == "" {
+		return rawMsg
+	}
+
+	var msg Message
+	if err := json.Unmarshal(rawMsg, &msg); err != nil {
+		return rawMsg
+	}
+
+	if msg.Candidate == "" {
+		return rawMsg
+	}
+
+	// Parse the candidate string into space-separated fields
+	fields := strings.Fields(msg.Candidate)
+	if len(fields) < 6 {
+		return rawMsg
+	}
+
+	address := fields[4]
+
+	// Check if the address is an mDNS UUID
+	if !mdnsPattern.MatchString(address) {
+		return rawMsg
+	}
+
+	// Replace mDNS address with real IP
+	realIP := from.RemoteIP
+
+	// For IPv6 loopback (::1), use 127.0.0.1 instead since the
+	// sender may not have IPv6 candidate pairs to match.
+	if realIP == "::1" || realIP == "[::1]" {
+		realIP = "127.0.0.1"
+	}
+
+	fields[4] = realIP
+	msg.Candidate = strings.Join(fields, " ")
+
+	log.Printf("[Hub] mDNS replacement for %s: %s → %s (in candidate field)",
+		from.ID, address, realIP)
+
+	replaced, err := json.Marshal(msg)
+	if err != nil {
+		return rawMsg
+	}
+	return replaced
 }

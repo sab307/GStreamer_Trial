@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -17,12 +18,14 @@ const (
 
 // Client represents a WebSocket connection (sender or receiver).
 type Client struct {
-	hub     *Hub
-	conn    *websocket.Conn
-	send    chan []byte
-	ID      string
-	Role    string   // "sender" or "receiver"
-	Streams []string // stream IDs (for senders)
+	hub        *Hub
+	conn       *websocket.Conn
+	send       chan []byte
+	ID         string
+	Role       string          // "sender" or "receiver"
+	Streams    []string        // stream IDs (for senders)
+	IceServers json.RawMessage // ICE server config from sender
+	RemoteIP   string          // real IP from WebSocket connection (for mDNS replacement)
 
 	mu     sync.Mutex
 	closed bool
