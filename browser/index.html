@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Teleoperation Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Chart.js for latency graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <!-- Header -->
+    <header id="header">
+        <div class="header-left">
+            <div class="logo-mark"></div>
+            <h1>WebRTC Teleoperation</h1>
+        </div>
+        <div class="header-center">
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span class="status-text">Disconnected</span>
+            </div>
+            <div class="clock-info">
+                <span class="label">Clock Offset:</span>
+                <span id="clockOffset">--</span> ms
+                <span class="sep">|</span>
+                <span class="label">RTT:</span>
+                <span id="clockRTT">--</span> ms
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="threshold-control">
+                <label for="latencyThreshold">Latency Threshold</label>
+                <div class="threshold-input-wrap">
+                    <input type="number" id="latencyThreshold" value="100" min="1" max="5000" step="5">
+                    <span class="unit">ms</span>
+                </div>
+            </div>
+            <button id="connectBtn" class="btn btn-connect">Connect</button>
+        </div>
+    </header>
+
+    <!-- Main content -->
+    <main id="main">
+        <!-- Streams will be dynamically added here -->
+        <div id="streamsContainer" class="streams-grid">
+            <!-- Template (hidden) -->
+            <template id="streamTemplate">
+                <div class="stream-card" data-stream-id="">
+                    <div class="stream-header">
+                        <h3 class="stream-name"></h3>
+                        <div class="stream-badges">
+                            <span class="badge badge-codec"></span>
+                            <span class="badge badge-latency">-- ms</span>
+                        </div>
+                    </div>
+                    <div class="stream-body">
+                        <div class="video-container">
+                            <video autoplay playsinline muted></video>
+                            <div class="video-overlay">
+                                <span class="fps-counter">0 fps</span>
+                            </div>
+                        </div>
+                        <div class="latency-panel">
+                            <div class="latency-chart-container">
+                                <canvas class="latency-chart"></canvas>
+                            </div>
+                            <div class="latency-breakdown">
+                                <div class="breakdown-item">
+                                    <span class="breakdown-label">Encode</span>
+                                    <span class="breakdown-value encode-val">--</span>
+                                </div>
+                                <div class="breakdown-item">
+                                    <span class="breakdown-label">Packetize</span>
+                                    <span class="breakdown-value pkt-val">--</span>
+                                </div>
+                                <div class="breakdown-item">
+                                    <span class="breakdown-label">Network</span>
+                                    <span class="breakdown-value net-val">--</span>
+                                </div>
+                                <div class="breakdown-item">
+                                    <span class="breakdown-label">Decode</span>
+                                    <span class="breakdown-value decode-val">--</span>
+                                </div>
+                                <div class="breakdown-item">
+                                    <span class="breakdown-label">Render</span>
+                                    <span class="breakdown-value render-val">--</span>
+                                </div>
+                                <div class="breakdown-item total">
+                                    <span class="breakdown-label">Total</span>
+                                    <span class="breakdown-value total-val">--</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <!-- Empty state -->
+        <div id="emptyState" class="empty-state">
+            <div class="empty-icon">📡</div>
+            <h2>Waiting for Streams</h2>
+            <p>Connect to the signaling server and start a ROS2 sender to begin receiving video streams.</p>
+            <div class="connection-guide">
+                <code>python sender/main.py --codec h264 --topics /camera/front /camera/rear</code>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer stats bar -->
+    <footer id="footer">
+        <div class="footer-stat">
+            <span class="label">Streams:</span>
+            <span id="streamCount">0</span>
+        </div>
+        <div class="footer-stat">
+            <span class="label">Sync Quality:</span>
+            <span id="syncQuality">--</span>
+        </div>
+        <div class="footer-stat">
+            <span class="label">Avg Latency:</span>
+            <span id="avgLatency">--</span>
+        </div>
+        <div class="footer-stat">
+            <span class="label">Server:</span>
+            <span id="serverAddr">--</span>
+        </div>
+    </footer>
+
+    <!-- Scripts (order matters) -->
+    <script src="clock_sync.js"></script>
+    <script src="latency.js"></script>
+    <script src="webrtc.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
