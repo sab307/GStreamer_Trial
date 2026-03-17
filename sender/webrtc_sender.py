@@ -386,10 +386,32 @@ class WebRTCSender:
             logger.warning(f"[ICE] Unknown stream for remote candidate: {stream_id}")
 
     def _on_data_channel_open(self, dc, stream_id: str):
-        """Data channel opened."""
+        """Data channel opened — connect message handler for clock sync pings."""
         logger.info(f"Data channel opened: {stream_id}")
         self.data_channels[stream_id] = dc
         self._dc_open.add(stream_id)
+        # Browser sends dc_ping to sync its clock directly against our time.time()
+        # (the same clock used for wst in frame timestamps).
+        dc.connect('on-message-string', self._on_dc_message, stream_id)
+
+    def _on_dc_message(self, dc, msg_str: str, stream_id: str):
+        """Handle incoming data channel message from browser (e.g. dc_ping for clock sync)."""
+        try:
+            data = json.loads(msg_str)
+            if data.get('type') == 'dc_ping':
+                # Stamp t2 and t3 with the same clock (time.time()) used for wst.
+                # NTP formula: offset = ((t2-t1) + (t3-t4)) / 2
+                # Setting t2 == t3 is standard for immediate responses (like the Go server does).
+                now_ms = time.time() * 1000
+                reply = json.dumps({
+                    'type': 'dc_pong',
+                    't1': data['t1'],
+                    't2': now_ms,
+                    't3': now_ms,
+                })
+                dc.emit('send-string', reply)
+        except Exception as e:
+            logger.debug(f"DC message parse error on {stream_id}: {e}")
 
     def _on_data_channel_close(self, dc, stream_id: str):
         """Data channel closed."""
