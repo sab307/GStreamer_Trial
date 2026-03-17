@@ -21,6 +21,7 @@
         signalingUrl: DEFAULT_SIGNALING,
         threshold: 100,
         connected: false,
+        dcSyncActive: false,   // true once a dc_pong has been received from sender
     };
 
     // ---- Instances ----
@@ -36,17 +37,20 @@
         clockOffset: document.getElementById('clockOffset'),
         clockRTT: document.getElementById('clockRTT'),
         thresholdInput: document.getElementById('latencyThreshold'),
+        serverUrlInput: document.getElementById('serverUrl'),
         streamsContainer: document.getElementById('streamsContainer'),
         emptyState: document.getElementById('emptyState'),
         streamTemplate: document.getElementById('streamTemplate'),
         streamCount: document.getElementById('streamCount'),
         syncQuality: document.getElementById('syncQuality'),
         avgLatency: document.getElementById('avgLatency'),
+        clockOffsetFooter: document.getElementById('clockOffsetFooter'),
         serverAddr: document.getElementById('serverAddr'),
     };
 
     // ---- Intervals ----
     let clockSyncInterval = null;
+    let dcClockSyncInterval = null;
     let chartRenderInterval = null;
     let uiUpdateInterval = null;
     // REMOVED: decodeStatsInterval — no longer needed since we get decode
@@ -65,8 +69,10 @@
         // Listen for latency alert events (bubbles up from chart canvas)
         document.addEventListener('latency-alert', onLatencyAlert);
 
-        // Set server address display
-        dom.serverAddr.textContent = window.location.host || 'localhost:8080';
+        // Pre-fill server input and display
+        const defaultHost = window.location.host || 'localhost:8080';
+        if (dom.serverUrlInput) dom.serverUrlInput.placeholder = defaultHost;
+        dom.serverAddr.textContent = defaultHost;
 
         // Initialize clock sync
         clockSync = new ClockSync();
@@ -89,7 +95,10 @@
 
     function connect() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        state.signalingUrl = `${wsProtocol}//${window.location.host}`;
+        const serverHost = (dom.serverUrlInput && dom.serverUrlInput.value.trim())
+            || window.location.host
+            || 'localhost:8080';
+        state.signalingUrl = `${wsProtocol}//${serverHost}`;
 
         webrtc = new WebRTCManager(state.signalingUrl);
 
@@ -98,11 +107,32 @@
         webrtc.onStreamAdded = onStreamAdded;
         webrtc.onStreamRemoved = onStreamRemoved;
         webrtc.onTimestampMessage = onTimestampMessage;
-        webrtc.onClockSyncMessage = (msg) => clockSync.handlePongMessage(msg);
+        webrtc.onClockSyncMessage = (msg) => {
+            // WebSocket clock sync (browser ↔ Go signaling server).
+            // Only used as fallback before DataChannel sync is established.
+            if (!state.dcSyncActive) {
+                clockSync.handlePongMessage(msg);
+            }
+        };
+        webrtc.onDCClockSyncMessage = (msg) => {
+            // DataChannel clock sync (browser ↔ Python sender, same clock as wst).
+            // This is more accurate: t2/t3 come from Python's time.time().
+            clockSync.handlePongMessage(msg);
+            if (!state.dcSyncActive) {
+                state.dcSyncActive = true;
+                console.log('[App] DC clock sync active — WebSocket sync suppressed');
+            }
+        };
+        webrtc.onDCChannelOpen = (streamId) => {
+            console.log(`[App] Data channel open: ${streamId} — DC clock sync ready`);
+        };
         webrtc.onSenderJoined = onSenderJoined;
         webrtc.onSenderLeft = onSenderLeft;
 
         webrtc.connect();
+
+        // Show the resolved server address in the footer
+        dom.serverAddr.textContent = serverHost;
     }
 
     function disconnect() {
@@ -113,6 +143,7 @@
         stopIntervals();
         clearAllStreams();
         state.connected = false;
+        state.dcSyncActive = false;
         updateConnectionUI('disconnected');
     }
 
@@ -128,11 +159,24 @@
     }
 
     function startIntervals() {
-        // Clock sync ping/pong
+        // WebSocket clock sync — fallback until DataChannel sync takes over
         clockSyncInterval = setInterval(() => {
-            if (webrtc && state.connected) {
+            if (webrtc && state.connected && !state.dcSyncActive) {
                 const msg = clockSync.createPingMessage();
                 webrtc.sendClockSync(msg);
+            }
+        }, CLOCK_SYNC_INTERVAL);
+
+        // DataChannel clock sync — pings directly through the WebRTC data channel.
+        // t2/t3 in the pong come from Python's time.time(), the same clock as wst.
+        // Once the first dc_pong arrives, state.dcSyncActive becomes true and
+        // WS pings (above) stop being sent.
+        dcClockSyncInterval = setInterval(() => {
+            if (webrtc && state.connected) {
+                const t1 = performance.now() + performance.timeOrigin;
+                // Record the pending ping manually so handlePongMessage can correlate it
+                clockSync.pendingPing = { t1, localT1: performance.now(), id: ++clockSync.syncCount };
+                webrtc.sendDCClockSync({ type: 'dc_ping', t1 });
             }
         }, CLOCK_SYNC_INTERVAL);
 
@@ -153,9 +197,11 @@
 
     function stopIntervals() {
         if (clockSyncInterval) clearInterval(clockSyncInterval);
+        if (dcClockSyncInterval) clearInterval(dcClockSyncInterval);
         if (chartRenderInterval) clearInterval(chartRenderInterval);
         if (uiUpdateInterval) clearInterval(uiUpdateInterval);
         clockSyncInterval = null;
+        dcClockSyncInterval = null;
         chartRenderInterval = null;
         uiUpdateInterval = null;
     }
@@ -328,6 +374,22 @@
         setText('.render-val', `${c.render.toFixed(1)} ms`);
         setText('.total-val', `${c.total.toFixed(1)} ms`);
 
+        // Percentiles & jitter
+        setText('.p50-val',    stats.p50    > 0 ? `${stats.p50.toFixed(1)} ms`    : '--');
+        setText('.p99-val',    stats.p99    > 0 ? `${stats.p99.toFixed(1)} ms`    : '--');
+        setText('.jitter-val', stats.jitter > 0 ? `${stats.jitter.toFixed(1)} ms` : '--');
+
+        // Sync source indicator — DC (green) once DataChannel clock sync is active
+        const syncEl = card.querySelector('.sync-mode-val');
+        if (syncEl) {
+            const usingDC = state.dcSyncActive;
+            syncEl.textContent = usingDC ? 'DC' : 'WS';
+            syncEl.className = `breakdown-value sync-mode-val ${usingDC ? 'sync-mode-dc' : 'sync-mode-ws'}`;
+        }
+
+        // Codec hint (Baseline preference applied in SDP)
+        setText('.codec-mode-val', 'H264 BL');
+
         // Update badges
         setText('.badge-latency', `${c.total.toFixed(0)} ms`);
 
@@ -374,6 +436,7 @@
     function onClockSyncUpdate(offset, rtt, quality) {
         dom.clockOffset.textContent = offset.toFixed(1);
         dom.clockRTT.textContent = rtt.toFixed(1);
+        if (dom.clockOffsetFooter) dom.clockOffsetFooter.textContent = offset.toFixed(1);
     }
 
     // ============================================================
@@ -406,9 +469,11 @@
     function updateFooterStats() {
         dom.streamCount.textContent = streamCards.size;
 
-        // Sync quality
+        // Sync quality with color coding
         const syncStats = clockSync.getStats();
-        dom.syncQuality.textContent = syncStats.quality;
+        const q = syncStats.quality;
+        dom.syncQuality.textContent = q;
+        dom.syncQuality.className = `sync-${q}`;
 
         // Average latency across all streams
         let totalLatency = 0;
