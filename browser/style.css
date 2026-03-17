@@ -25,12 +25,14 @@
     --danger-dim: rgba(239, 68, 68, 0.12);
     --danger-glow: rgba(239, 68, 68, 0.3);
 
-    /* Graph colors */
-    --graph-encode: #a78bfa;
-    --graph-packetize: #38bdf8;
-    --graph-network: #f59e0b;
-    --graph-total: #22c55e;
-    --graph-threshold: #ef4444;
+    /* Graph colors — hue-wheel spaced for maximum distinctness */
+    --graph-total:      #4ade80;   /* lime green   — Total        */
+    --graph-network:    #facc15;   /* yellow       — Network      */
+    --graph-encode:     #f97316;   /* orange       — Encode       */
+    --graph-decode:     #818cf8;   /* indigo       — Decode       */
+    --graph-render:     #fb7185;   /* rose/coral   — Render       */
+    --graph-packetize:  #22d3ee;   /* cyan         — Packetize    */
+    --graph-threshold:  #ef4444;   /* red          — Threshold    */
     --graph-danger-bg: rgba(239, 68, 68, 0.08);
 
     /* Sizing */
@@ -123,6 +125,12 @@ header h1 {
 .connection-status.connected .status-dot {
     background: var(--success);
     box-shadow: 0 0 6px var(--success);
+    animation: dot-ping 2s ease-in-out infinite;
+}
+
+@keyframes dot-ping {
+    0%, 100% { box-shadow: 0 0 4px var(--success); }
+    50%       { box-shadow: 0 0 10px var(--success), 0 0 20px rgba(34, 197, 94, 0.3); }
 }
 
 .clock-info {
@@ -233,16 +241,27 @@ main {
     border: 1px solid var(--border-color);
     border-radius: var(--radius);
     overflow: hidden;
-    transition: border-color 0.2s;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    /* Accent top-line for visual hierarchy */
+    border-top: 2px solid var(--accent-dim);
 }
 
 .stream-card:hover {
     border-color: var(--border-hover);
+    border-top-color: var(--accent);
+    box-shadow: 0 4px 24px rgba(56, 189, 248, 0.06);
 }
 
 .stream-card.alert {
     border-color: var(--danger);
+    border-top-color: var(--danger);
     box-shadow: 0 0 20px var(--danger-dim), inset 0 0 30px var(--danger-dim);
+    animation: alert-pulse 2s ease-in-out infinite;
+}
+
+@keyframes alert-pulse {
+    0%, 100% { box-shadow: 0 0 20px var(--danger-dim); }
+    50% { box-shadow: 0 0 32px var(--danger-glow); }
 }
 
 .stream-header {
@@ -251,7 +270,7 @@ main {
     justify-content: space-between;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border-color);
-    background: var(--bg-elevated);
+    background: linear-gradient(90deg, var(--bg-elevated) 0%, #1c2840 100%);
 }
 
 .stream-name {
@@ -349,7 +368,7 @@ main {
 
 .latency-breakdown {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 6px;
     margin-top: 8px;
     padding-top: 8px;
@@ -375,14 +394,31 @@ main {
     font-weight: 700;
 }
 
-.encode-val { color: var(--graph-encode); }
-.pkt-val { color: var(--graph-packetize); }
-.net-val { color: var(--graph-network); }
-.total-val { color: var(--graph-total); }
+.encode-val    { color: var(--graph-encode); }      /* orange   */
+.pkt-val       { color: var(--graph-packetize); }   /* cyan     */
+.net-val       { color: var(--graph-network); }     /* yellow   */
+.decode-val    { color: var(--graph-decode); }      /* indigo   */
+.render-val    { color: var(--graph-render); }      /* rose     */
+.total-val     { color: var(--graph-total); }       /* lime     */
+/* Percentiles & jitter */
+.p50-val       { color: var(--graph-total); }       /* lime     */
+.p99-val       { color: var(--warning); }           /* amber    */
+.jitter-val    { color: var(--graph-network); }     /* yellow   */
+.codec-mode-val { color: var(--accent); }
+/* Sync source */
+.sync-mode-dc  { color: var(--success); }
+.sync-mode-ws  { color: var(--text-muted); }
 
 .breakdown-item.total .breakdown-value {
     font-size: 15px;
 }
+
+/* Sync quality color states */
+.sync-excellent { color: #22c55e; }
+.sync-good      { color: #86efac; }
+.sync-fair      { color: var(--warning); }
+.sync-poor      { color: var(--danger); }
+.sync-unknown   { color: var(--text-muted); }
 
 /* Alert state for chart background */
 .latency-chart-container.alert {
@@ -466,6 +502,26 @@ footer {
 .footer-stat span:last-child {
     color: var(--text-secondary);
     font-weight: 600;
+}
+
+/* Server URL input */
+.server-input-wrap input {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 12px;
+    width: 140px;
+    outline: none;
+}
+
+.server-input-wrap input::placeholder {
+    color: var(--text-muted);
+}
+
+/* Footer right-push */
+.footer-stat-right {
+    margin-left: auto;
 }
 
 /* ---- Scrollbar ---- */
