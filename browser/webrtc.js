@@ -21,6 +21,8 @@ class WebRTCManager {
         this.onStreamRemoved = null;       // (streamId) => {}
         this.onTimestampMessage = null;    // (streamId, data) => {}
         this.onClockSyncMessage = null;    // (data) => {}
+        this.onDCClockSyncMessage = null;  // (pongData) => {} — from sender via DataChannel
+        this.onDCChannelOpen = null;       // (streamId) => {}
         this.onConnectionStateChange = null; // (state) => {}
         this.onSenderJoined = null;        // (senderId, streams) => {}
         this.onSenderLeft = null;          // (senderId) => {}
@@ -191,16 +193,18 @@ class WebRTCManager {
                 sdp: sdp,
             }));
 
-            // Create answer
+            // Create answer, preferring H.264 Baseline (no B-frames, lower decode latency)
             const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+            const preferredSdp = this._preferH264Baseline(answer.sdp);
+            const finalAnswer = new RTCSessionDescription({ type: 'answer', sdp: preferredSdp });
+            await pc.setLocalDescription(finalAnswer);
 
             // Send answer back via signaling
             this._send({
                 type: 'answer',
                 stream_id: streamId,
                 sender_id: senderId,
-                sdp: answer.sdp,
+                sdp: preferredSdp,
             });
 
             console.log(`[WebRTC] Sent answer for stream: ${streamId}`);
@@ -296,6 +300,13 @@ class WebRTCManager {
 
             this.dataChannels.set(streamId, dc);
 
+            dc.onopen = () => {
+                console.log(`[WebRTC] Data channel open: ${streamId}`);
+                if (this.onDCChannelOpen) {
+                    this.onDCChannelOpen(streamId);
+                }
+            };
+
             dc.onmessage = (msgEvent) => {
                 try {
                     const data = JSON.parse(msgEvent.data);
@@ -303,6 +314,11 @@ class WebRTCManager {
                     if (data.type === 'frame_ts') {
                         if (this.onTimestampMessage) {
                             this.onTimestampMessage(streamId, data);
+                        }
+                    } else if (data.type === 'dc_pong') {
+                        // Clock sync pong from sender — t2/t3 stamped by Python time.time()
+                        if (this.onDCClockSyncMessage) {
+                            this.onDCClockSyncMessage(data);
                         }
                     } else if (data.type === 'clock_info') {
                         // Clock info from sender - can be used for additional sync
@@ -326,6 +342,70 @@ class WebRTCManager {
      */
     sendClockSync(message) {
         this._send(JSON.parse(message));
+    }
+
+    /**
+     * Send a dc_ping clock sync through a data channel.
+     * Uses the first open data channel found (any stream works — all go to same sender).
+     * t2/t3 in the pong will be stamped by Python time.time(), the same clock used for wst.
+     * @param {Object} pingMsg - {type:'dc_ping', t1:number}
+     * @returns {boolean} true if a DC was found and the message was sent
+     */
+    sendDCClockSync(pingMsg) {
+        for (const [, dc] of this.dataChannels) {
+            if (dc.readyState === 'open') {
+                dc.send(JSON.stringify(pingMsg));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reorder m=video payload types to prefer H.264 Baseline (profile-level-id 42xxxx).
+     * Baseline has no B-frames and simpler entropy coding → lower decode latency.
+     * Called on the answer SDP before setLocalDescription so the sender sees our preference.
+     * @param {string} sdp - SDP string from createAnswer()
+     * @returns {string} Modified SDP with Baseline H264 PTs first (unchanged if none found)
+     */
+    _preferH264Baseline(sdp) {
+        const sep = sdp.includes('\r\n') ? '\r\n' : '\n';
+        const lines = sdp.split(sep);
+
+        // Step 1: collect H264 payload types from a=rtpmap lines
+        const h264PTs = new Set();
+        for (const line of lines) {
+            const m = line.match(/^a=rtpmap:(\d+) H264\/90000/i);
+            if (m) h264PTs.add(m[1]);
+        }
+        if (h264PTs.size === 0) return sdp;
+
+        // Step 2: which of those H264 PTs have Baseline profile (first byte of profile-level-id = 42)?
+        const baselinePTs = [];
+        for (const pt of h264PTs) {
+            for (const line of lines) {
+                const fm = line.match(new RegExp(`^a=fmtp:${pt} .*profile-level-id=([0-9a-fA-F]{6})`, 'i'));
+                if (fm && fm[1].toLowerCase().startsWith('42')) {
+                    baselinePTs.push(pt);
+                    break;
+                }
+            }
+        }
+        if (baselinePTs.length === 0) return sdp;
+
+        // Step 3: reorder m=video PT list — Baseline PTs first
+        return lines.map(line => {
+            if (!line.startsWith('m=video')) return line;
+            const parts = line.split(' ');
+            const header = parts.slice(0, 3);   // 'm=video', port, protocol
+            const allPTs = parts.slice(3);
+            const reordered = [
+                ...baselinePTs.filter(pt => allPTs.includes(pt)),
+                ...allPTs.filter(pt => !baselinePTs.includes(pt)),
+            ];
+            console.log(`[WebRTC] H264 Baseline preferred PTs: [${baselinePTs}] of [${allPTs}]`);
+            return [...header, ...reordered].join(' ');
+        }).join(sep);
     }
 
     /**
