@@ -101,9 +101,9 @@ class LatencyTracker {
                     {
                         label: 'Total',
                         data: this.data.total,
-                        borderColor: '#22c55e',
-                        backgroundColor: 'rgba(34, 197, 94, 0.1)',
-                        borderWidth: 2,
+                        borderColor: '#4ade80',              // lime green
+                        backgroundColor: 'rgba(74,222,128,0.08)',
+                        borderWidth: 2.5,
                         fill: false,
                         tension: 0.3,
                         pointRadius: 0,
@@ -112,7 +112,7 @@ class LatencyTracker {
                     {
                         label: 'Network',
                         data: this.data.network,
-                        borderColor: '#f59e0b',
+                        borderColor: '#facc15',              // yellow
                         borderWidth: 1.5,
                         fill: false,
                         tension: 0.3,
@@ -122,7 +122,7 @@ class LatencyTracker {
                     {
                         label: 'Encode',
                         data: this.data.encode,
-                        borderColor: '#a78bfa',
+                        borderColor: '#f97316',              // orange
                         borderWidth: 1.5,
                         fill: false,
                         tension: 0.3,
@@ -132,7 +132,7 @@ class LatencyTracker {
                     {
                         label: 'Decode',
                         data: this.data.decode,
-                        borderColor: '#f472b6',
+                        borderColor: '#818cf8',              // indigo / periwinkle
                         borderWidth: 1.5,
                         fill: false,
                         tension: 0.3,
@@ -142,7 +142,7 @@ class LatencyTracker {
                     {
                         label: 'Render',
                         data: this.data.render,
-                        borderColor: '#34d399',
+                        borderColor: '#fb7185',              // rose / coral
                         borderWidth: 1,
                         fill: false,
                         tension: 0.3,
@@ -153,7 +153,7 @@ class LatencyTracker {
                     {
                         label: 'Packetize',
                         data: this.data.packetize,
-                        borderColor: '#38bdf8',
+                        borderColor: '#22d3ee',              // cyan
                         borderWidth: 1,
                         fill: false,
                         tension: 0.3,
@@ -164,7 +164,7 @@ class LatencyTracker {
                     {
                         label: 'Threshold',
                         data: [],
-                        borderColor: '#ef4444',
+                        borderColor: '#ef4444',              // red (reference line, not a metric)
                         borderWidth: 1.5,
                         borderDash: [6, 3],
                         fill: false,
@@ -431,17 +431,33 @@ class LatencyTracker {
      */
     getStats() {
         const recent = this.data.total.slice(-30);
-        const avg = recent.length > 0
-            ? recent.reduce((a, b) => a + b, 0) / recent.length
-            : 0;
-        const max = recent.length > 0 ? Math.max(...recent) : 0;
-        const min = recent.length > 0 ? Math.min(...recent) : 0;
+        const n = recent.length;
+        const avg = n > 0 ? recent.reduce((a, b) => a + b, 0) / n : 0;
+        const max = n > 0 ? Math.max(...recent) : 0;
+        const min = n > 0 ? Math.min(...recent) : 0;
+
+        // P50 / P99 of total latency
+        let p50 = 0, p99 = 0;
+        if (n > 0) {
+            const sorted = [...recent].sort((a, b) => a - b);
+            p50 = sorted[Math.floor(n * 0.50)];
+            p99 = sorted[Math.min(Math.floor(n * 0.99), n - 1)];
+        }
+
+        // Jitter = population stdev of network latency (last 30 samples)
+        const recentNet = this.data.network.slice(-30);
+        let jitter = 0;
+        if (recentNet.length > 1) {
+            const netAvg = recentNet.reduce((a, b) => a + b, 0) / recentNet.length;
+            const variance = recentNet.reduce((s, v) => s + (v - netAvg) ** 2, 0) / recentNet.length;
+            jitter = Math.sqrt(variance);
+        }
 
         return {
             current: { ...this.current },
-            avg: avg,
-            max: max,
-            min: min,
+            avg, max, min,
+            p50, p99,
+            jitter,
             fps: this.fps,
             isAlert: this._isAlert,
             frameCount: this.frameCount,
