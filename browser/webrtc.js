@@ -31,6 +31,13 @@ class WebRTCManager {
         this._connected = false;
         this._receiverId = `browser_${Date.now().toString(36)}`;
 
+        // Clock provider for dc_ack timestamps.
+        // Default: raw browser wall clock.  App wires this to clockSync.now()
+        // once ClockSync has been calibrated against the Python sender, so
+        // dc_ack receive_time is in the same epoch as wst (Python time.time()*1000).
+        // OWD = receive_time - wst then needs no further correction on the sender.
+        this.clockSyncNow = () => performance.now() + performance.timeOrigin;
+
         // ICE servers
         this.iceServers = [
             { urls: 'stun:stun.l.google.com:19302' },
@@ -312,6 +319,21 @@ class WebRTCManager {
                     const data = JSON.parse(msgEvent.data);
 
                     if (data.type === 'frame_ts') {
+                        // ── SCReAM feedback: echo fid + receive time back to sender ──
+                        // receive_time uses clockSyncNow() which equals Python time.time()*1000
+                        // once DC clock sync is active.  On the sender:
+                        //   OWD = ack.receive_time - frame_ts.wst   (same clock, no correction)
+                        // We rate-limit ACKs: every frame is ACK'd but the sender only acts
+                        // on them every 200ms (UPDATE_INTERVAL_S), so DataChannel bandwidth
+                        // overhead is ~30 frames/s × ~50 bytes = ~1.5 kbps — negligible.
+                        if (dc.readyState === 'open') {
+                            dc.send(JSON.stringify({
+                                type: 'dc_ack',
+                                fid:          data.fid,
+                                receive_time: this.clockSyncNow(),
+                            }));
+                        }
+
                         if (this.onTimestampMessage) {
                             this.onTimestampMessage(streamId, data);
                         }
