@@ -102,6 +102,12 @@
 
         webrtc = new WebRTCManager(state.signalingUrl);
 
+        // Give WebRTCManager access to the calibrated clock so dc_ack timestamps
+        // are in Python time.time()*1000 — the same epoch as wst in frame_ts.
+        // This makes OWD = ack.receive_time - wst correct without any offset math
+        // on the Python side.  clockSync.now() = performance.now() + timeOrigin + offset.
+        webrtc.clockSyncNow = () => clockSync.now();
+
         // Wire up callbacks
         webrtc.onConnectionStateChange = onConnectionStateChange;
         webrtc.onStreamAdded = onStreamAdded;
