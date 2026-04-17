@@ -24,13 +24,27 @@ except ImportError:
 class ROS2CameraBridge:
     """Bridges ROS2 image topics to GStreamer pipelines."""
 
-    def __init__(self, topics: list, width: int = 640, height: int = 480):
+    def __init__(self, topics: list, width: int = 640, height: int = 480, fps: int = 30):
         self.topics = topics
         self.width = width
         self.height = height
+        self.fps = fps
         self.frame_callbacks: Dict[str, Callable] = {}
         self._node = None
         self._spin_thread = None
+
+        # Frame throttle: tracks the monotonic timestamp (ns) of the last frame
+        # forwarded to the pipeline for each topic.
+        #
+        # ROS2 camera drivers often publish faster than the encoder's target FPS.
+        # For example, a camera configured at 60fps produces 60 messages/sec but
+        # our encoder only needs 30. Without throttling, we push 2× more frames
+        # than the encoder can process, doubling its CPU load.
+        #
+        # The throttle skips any frame that arrives sooner than (1 / fps) seconds
+        # after the last forwarded frame. No lock needed — each topic's callback
+        # fires from the same ROS2 spin thread sequentially.
+        self._last_push_ns: Dict[str, int] = {}
 
     def register_callback(self, topic: str, callback: Callable):
         """Register a callback for when a frame arrives on a topic."""
@@ -80,6 +94,22 @@ class ROS2CameraBridge:
     def _on_image(self, msg, topic: str):
         """Handle incoming ROS2 Image message."""
         capture_ts = time.monotonic_ns()
+
+        # Frame throttle: drop frames that arrive faster than the target FPS.
+        #
+        # min_gap_ns is the minimum time that must have passed since the last
+        # frame we forwarded for this topic. At 30fps that's 33,333,333 ns (33ms).
+        #
+        # Example: camera publishes at 60fps (one frame every ~16ms).
+        #   - Frame 1 arrives at t=0     - forwarded, _last_push_ns = 0
+        #   - Frame 2 arrives at t=16ms  - 16ms < 33ms - DROPPED
+        #   - Frame 3 arrives at t=33ms  - 33ms >= 33ms - forwarded, _last_push_ns = 33ms
+        #   - Frame 4 arrives at t=49ms  - 49-33=16ms < 33ms - DROPPED
+        # Result: exactly 30 frames/sec enter the GStreamer pipeline.
+        min_gap_ns = 1_000_000_000 // self.fps
+        if capture_ts - self._last_push_ns.get(topic, 0) < min_gap_ns:
+            return
+        self._last_push_ns[topic] = capture_ts
 
         try:
             # Always use manual numpy conversion — cv_bridge is unreliable
