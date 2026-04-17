@@ -1,8 +1,14 @@
 """
 GStreamer pipeline builder for ROS2 image topics.
-Supports VP8, VP9, H264, H265 encoding with timestamp injection.
+Supports VP8, VP9, H264, H265, and H264-VAAPI encoding with timestamp injection.
 
 Uses webrtcbin for WebRTC transport (GstWebRTC).
+
+Hardware encoding note:
+    h264_vaapi uses the Intel iGPU via VAAPI. Before using it, verify support:
+        $ vainfo | grep h264
+    If the command returns entries, hardware encoding is available and recommended
+    for the RR100 — it offloads the encoder off the CPU cores entirely.
 """
 
 import gi
@@ -77,6 +83,40 @@ CODEC_CONFIG = {
         "clock_rate": 90000,
         "payload_type": 99,
     },
+
+    # Hardware H264 encoding via Intel iGPU (VAAPI).
+    #
+    # vaapih264enc runs entirely on the GPU's dedicated video engine, not the
+    # CPU cores. On a compute board like the RR100, this frees the CPU for
+    # ROS2 navigation, localization, and control loops.
+    #
+    # rate-control=2  → CBR (constant bitrate). Stable throughput matters more
+    #                   than quality in live teleoperation.
+    # quality-level=4 → Mid-range (0=best quality, 7=fastest). A value of 4
+    #                   gives acceptable quality at very low GPU load.
+    # keyframe-period → Keyframe every 60 frames. Allows browser to recover
+    #                   from packet loss within ~2 seconds at 30fps.
+    #
+    # Check availability on the RR100:
+    #   vainfo 2>&1 | grep h264
+    # If the output is empty, fall back to "h264" (software x264enc).
+    "h264_vaapi": {
+        "encoder": "vaapih264enc",
+        "encoder_props": {
+            "rate-control": 2,       # CBR
+            "bitrate": 2000,         # kbps — matches software h264 default
+            "keyframe-period": 60,
+            "quality-level": 4,
+        },
+        "payloader": "rtph264pay",
+        "payloader_props": {
+            "config-interval": -1,   # resend SPS/PPS with every keyframe
+            "aggregate-mode": 1,     # zero-latency RTP aggregation
+        },
+        "encoding_name": "H264",
+        "clock_rate": 90000,
+        "payload_type": 96,
+    },
 }
 
 
@@ -142,7 +182,7 @@ class GstPipelineBuilder:
             f'! video/x-raw,format=I420 '
             f'! {enc} name=encoder_{stream_id} '
             f'! {pay} name=payloader_{stream_id} '
-            f'! queue '
+            f'! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
             f'! application/x-rtp,media=video,encoding-name={enc_name},'
             f'payload={pt},clock-rate={clk} '
             f'! {webrtc_name}.'
@@ -165,6 +205,7 @@ class GstPipelineBuilder:
                 f'! video/x-raw,format=I420 '
                 f'! {enc} name=encoder_{stream_id} '
                 f'! {pay} name=payloader_{stream_id} '
+                f'! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
                 f'! application/x-rtp,media=video,encoding-name={enc_name},'
                 f'payload={pt},clock-rate={clk} '
                 f'! webrtcbin name={webrtc_name} bundle-policy=max-bundle'
@@ -184,6 +225,22 @@ class GstPipelineBuilder:
             raise RuntimeError("webrtcbin not found in pipeline")
         if not encoder:
             raise RuntimeError("encoder not found in pipeline")
+
+        # Prevent appsrc from blocking the ROS2 spin thread.
+        #
+        # By default, appsrc.emit("push-buffer") blocks the calling thread if
+        # GStreamer's internal input queue is full. The ROS2 spin thread is also
+        # the thread driving ALL ROS2 callbacks (odometry, joy, control loops).
+        # A blocked spin thread means those other subscribers stop firing too.
+        #
+        # block=False  → push-buffer returns immediately even if GStreamer is busy.
+        #                 The buffer is either accepted or silently discarded.
+        # max-bytes=1  → appsrc's internal buffer holds at most 1 byte worth of
+        #                 data, which in practice means it holds at most 1 frame.
+        #                 Combined with the leaky queue downstream, this keeps the
+        #                 pipeline at the current frame, never an old one.
+        self.appsrc.set_property("block", False)
+        self.appsrc.set_property("max-bytes", 1)
 
         logger.info(f"  Elements: appsrc={self.appsrc is not None}, "
                      f"encoder={encoder is not None}, "
