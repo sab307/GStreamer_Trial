@@ -24,10 +24,12 @@ except ImportError:
 class ROS2CameraBridge:
     """Bridges ROS2 image topics to GStreamer pipelines."""
 
-    def __init__(self, topics: list, width: int = 640, height: int = 480):
+    def __init__(self, topics: list, width: int = 640, height: int = 480,
+                 simulate: bool = False):
         self.topics = topics
         self.width = width
         self.height = height
+        self.simulate = simulate
         self.frame_callbacks: Dict[str, Callable] = {}
         self._node = None
         self._spin_thread = None
@@ -38,7 +40,7 @@ class ROS2CameraBridge:
 
     def start(self):
         """Start subscribing to ROS2 topics."""
-        if ROS2_AVAILABLE:
+        if ROS2_AVAILABLE and not self.simulate:
             self._start_ros2()
         else:
             logger.info("Starting simulated camera feeds")

@@ -20,6 +20,7 @@ var mdnsPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 type Message struct {
 	Type          string      `json:"type"`
 	SenderID      string      `json:"sender_id,omitempty"`
+	ReceiverID    string      `json:"receiver_id,omitempty"`
 	StreamID      string      `json:"stream_id,omitempty"`
 	SDP           string      `json:"sdp,omitempty"`
 	Candidate     string      `json:"candidate,omitempty"`
@@ -172,8 +173,9 @@ func (h *Hub) RouteMessage(from *Client, rawMsg []byte) {
 		h.RegisterClient(from)
 
 	case "offer":
-		// Sender → all receivers
-		h.routeToReceivers(rawMsg)
+		// Sender → one receiver. Media is broadcast by the sender's tee, but
+		// SDP and ICE state must remain private to one peer connection.
+		h.routeToReceiver(msg.ReceiverID, rawMsg)
 
 	case "answer":
 		// Receiver → specific sender
@@ -181,7 +183,7 @@ func (h *Hub) RouteMessage(from *Client, rawMsg []byte) {
 
 	case "ice_candidate":
 		if from.Role == "sender" {
-			h.routeToReceivers(rawMsg)
+			h.routeToReceiver(msg.ReceiverID, rawMsg)
 		} else {
 			// Replace mDNS addresses in browser ICE candidates with real IP.
 			// Chrome hides local IPs behind mDNS UUIDs for privacy.
@@ -239,6 +241,18 @@ func (h *Hub) routeToReceivers(rawMsg []byte) {
 
 	for _, recv := range h.receivers {
 		recv.Send(rawMsg)
+	}
+}
+
+// routeToReceiver sends a peer-specific signaling message to one receiver.
+func (h *Hub) routeToReceiver(receiverID string, rawMsg []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if receiver, ok := h.receivers[receiverID]; ok {
+		receiver.Send(rawMsg)
+	} else {
+		log.Printf("[Hub] Receiver not found: %s", receiverID)
 	}
 }
 

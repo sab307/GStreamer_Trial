@@ -54,7 +54,9 @@ class VideoSenderApp:
         self.pipeline_builders: dict = {}
         self.webrtc_sender = WebRTCSender(self.signaling_url, sender_id="ros2_gst_sender")
         self.timestamp_tracker = TimestampTracker()
-        self.ros2_bridge = ROS2CameraBridge(self.topics, self.width, self.height)
+        self.ros2_bridge = ROS2CameraBridge(
+            self.topics, self.width, self.height, simulate=args.simulate
+        )
 
         # GLib main loop for GStreamer
         self.glib_loop = GLib.MainLoop()
@@ -93,7 +95,7 @@ class VideoSenderApp:
 
             # Register with WebRTC sender (sets STUN, connects signals)
             self.webrtc_sender.register_pipeline(
-                stream_id, pipeline, builder.webrtcbin
+                stream_id, pipeline, builder
             )
 
             # Wire up the timing callback.
@@ -133,15 +135,17 @@ class VideoSenderApp:
         if fid == 1 or (fid % 300 == 0):
             logger.info(f"[TIMING] {stream_id}: enc={timing.get('enc')}ms "
                         f"pkt={timing.get('pkt')}ms spl={timing.get('spl')}ms "
-                        f"dc_open={stream_id in self.webrtc_sender._dc_open}")
+                        f"dc_open={any(key[1] == stream_id for key in self.webrtc_sender._dc_open)}")
 
-        if stream_id in self.webrtc_sender._dc_open:
-            dc = self.webrtc_sender.data_channels.get(stream_id)
+        for receiver_id, open_stream_id in list(self.webrtc_sender._dc_open):
+            if open_stream_id != stream_id:
+                continue
+            dc = self.webrtc_sender.data_channels.get((receiver_id, stream_id))
             if dc:
                 try:
                     dc.emit('send-string', json.dumps(timing))
                 except Exception as e:
-                    logger.warning(f"Failed to send timing for {stream_id}: {e}")
+                    logger.warning(f"Failed to send timing for {receiver_id}/{stream_id}: {e}")
 
     async def run_async(self):
         """Run the async components (signaling, WebRTC).
@@ -165,18 +169,15 @@ class VideoSenderApp:
         # Step 2: Connect to signaling (ONCE)
         await self.webrtc_sender.connect_signaling()
 
-        # Step 3: Start all GStreamer pipelines.
-        # This triggers on-negotiation-needed, but our sender gates offers
-        # on _has_receiver, so they're deferred until a browser connects.
+        # Step 3: Start the shared encoding pipelines.
         for stream_id, builder in self.pipeline_builders.items():
             builder.start()
             logger.info(f"Pipeline started for stream: {stream_id}")
 
-        # Step 4: Create data channels AFTER pipelines are PLAYING.
-        # webrtcbin asserts 'is_closed != TRUE' if called in NULL state.
+        # Step 4: Create channels now that all dynamic branches are PLAYING.
         self.webrtc_sender.create_data_channels()
 
-        # Step 4: Start ROS2 bridge (feeds frames into pipelines)
+        # Step 5: Start ROS2 bridge (feeds frames into shared pipelines)
         self.ros2_bridge.start()
 
         # Step 5: Keep alive + periodic clock info

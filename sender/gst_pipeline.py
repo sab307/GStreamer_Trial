@@ -92,9 +92,12 @@ class GstPipelineBuilder:
         self.width = width
         self.height = height
         self.fps = fps
+        self.stream_id = None
         self.pipeline = None
         self.appsrc = None
-        self.webrtcbin = None
+        self.rtp_tee = None
+        self.receiver_branches = {}
+        self._branch_sequence = 0
 
         # Timestamp tracking — probe-based EMA averages
         # Probes measure real encode/packetize time; we track rolling averages
@@ -123,6 +126,7 @@ class GstPipelineBuilder:
     def create_pipeline(self, stream_id: str) -> Gst.Pipeline:
         """Create and configure the GStreamer pipeline."""
         Gst.init(None)
+        self.stream_id = stream_id
 
         enc = self.config["encoder"]
         pay = self.config["payloader"]
@@ -130,11 +134,9 @@ class GstPipelineBuilder:
         pt = self.config["payload_type"]
         clk = self.config["clock_rate"]
 
-        # Pipeline: appsrc → videoconvert → encoder → payloader → webrtcbin
-        # Use dot notation: declare webrtcbin first, then link chain to it via 'name.'
-        webrtc_name = f"webrtc_{stream_id}"
+        # Shared media path: appsrc -> encoder -> payloader -> tee.
+        # Each receiver attaches an independent queue and webrtcbin branch.
         pipeline_str = (
-            f'webrtcbin name={webrtc_name} bundle-policy=max-bundle '
             f'appsrc name=source_{stream_id} is-live=true format=time '
             f'caps=video/x-raw,format=RGB,width={self.width},height={self.height},'
             f'framerate={self.fps}/1 '
@@ -142,10 +144,10 @@ class GstPipelineBuilder:
             f'! video/x-raw,format=I420 '
             f'! {enc} name=encoder_{stream_id} '
             f'! {pay} name=payloader_{stream_id} '
-            f'! queue '
             f'! application/x-rtp,media=video,encoding-name={enc_name},'
             f'payload={pt},clock-rate={clk} '
-            f'! {webrtc_name}.'
+            f'! tee name=rtp_tee_{stream_id} '
+            f'rtp_tee_{stream_id}. ! queue ! fakesink sync=false async=false'
         )
 
         logger.info(f"Creating pipeline for stream '{stream_id}'")
@@ -167,28 +169,29 @@ class GstPipelineBuilder:
                 f'! {pay} name=payloader_{stream_id} '
                 f'! application/x-rtp,media=video,encoding-name={enc_name},'
                 f'payload={pt},clock-rate={clk} '
-                f'! webrtcbin name={webrtc_name} bundle-policy=max-bundle'
+                f'! tee name=rtp_tee_{stream_id} '
+                f'rtp_tee_{stream_id}. ! queue ! fakesink sync=false async=false'
             )
             logger.info(f"  Fallback pipeline: {pipeline_str_fallback}")
             self.pipeline = Gst.parse_launch(pipeline_str_fallback)
 
         # Get element references
         self.appsrc = self.pipeline.get_by_name(f"source_{stream_id}")
-        self.webrtcbin = self.pipeline.get_by_name(webrtc_name)
+        self.rtp_tee = self.pipeline.get_by_name(f"rtp_tee_{stream_id}")
         encoder = self.pipeline.get_by_name(f"encoder_{stream_id}")
         payloader = self.pipeline.get_by_name(f"payloader_{stream_id}")
 
         if not self.appsrc:
             raise RuntimeError("appsrc not found in pipeline")
-        if not self.webrtcbin:
-            raise RuntimeError("webrtcbin not found in pipeline")
+        if not self.rtp_tee:
+            raise RuntimeError("RTP tee not found in pipeline")
         if not encoder:
             raise RuntimeError("encoder not found in pipeline")
 
         logger.info(f"  Elements: appsrc={self.appsrc is not None}, "
                      f"encoder={encoder is not None}, "
                      f"payloader={payloader is not None}, "
-                     f"webrtcbin={self.webrtcbin is not None}")
+                     f"rtp_tee={self.rtp_tee is not None}")
 
         # Apply encoder properties
         for prop, val in self.config["encoder_props"].items():
@@ -241,29 +244,105 @@ class GstPipelineBuilder:
         bus.connect("message::warning", self._on_bus_warning, stream_id)
         bus.connect("message::state-changed", self._on_bus_state, stream_id)
 
-        # Check webrtcbin sink pads
-        self._log_webrtcbin_pads(stream_id)
-
         return self.pipeline
 
-    def _log_webrtcbin_pads(self, stream_id: str):
-        """Log webrtcbin's current pads — helps debug linking issues."""
-        if not self.webrtcbin:
-            return
-        pads = []
-        it = self.webrtcbin.iterate_pads()
-        while True:
-            ok, pad = it.next()
-            if ok != Gst.IteratorResult.OK:
-                break
-            caps = pad.get_current_caps()
-            caps_str = caps.to_string() if caps else "no-caps"
-            pads.append(f"{pad.get_name()}({pad.get_direction()}): {caps_str}")
+    def add_receiver_branch(self, receiver_id: str):
+        """Attach an isolated queue and webrtcbin to the shared RTP tee."""
+        if receiver_id in self.receiver_branches:
+            return self.receiver_branches[receiver_id]["webrtcbin"]
 
-        if pads:
-            logger.info(f"  webrtcbin pads: {pads}")
-        else:
-            logger.warning(f"  webrtcbin has NO pads — linking may have failed!")
+        suffix = str(self._branch_sequence)
+        self._branch_sequence += 1
+        queue = Gst.ElementFactory.make("queue", f"queue_{self.stream_id}_{suffix}")
+        capsfilter = Gst.ElementFactory.make("capsfilter", f"caps_{self.stream_id}_{suffix}")
+        webrtcbin = Gst.ElementFactory.make("webrtcbin", f"webrtc_{self.stream_id}_{suffix}")
+        if not queue or not capsfilter or not webrtcbin:
+            raise RuntimeError(f"Could not create WebRTC branch for {receiver_id}")
+
+        queue.set_property("max-size-buffers", 30)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", 0)
+        queue.set_property("leaky", 2)  # downstream: discard old frames for slow peers
+        capsfilter.set_property("caps", Gst.Caps.from_string(
+            "application/x-rtp,media=video,"
+            f"encoding-name={self.config['encoding_name']},"
+            f"payload={self.config['payload_type']},"
+            f"clock-rate={self.config['clock_rate']}"
+        ))
+        webrtcbin.set_property("bundle-policy", "max-bundle")
+
+        sink_pad = None
+        tee_pad = None
+        added_elements = []
+        try:
+            for element in (queue, capsfilter, webrtcbin):
+                self.pipeline.add(element)
+                added_elements.append(element)
+            if not queue.link(capsfilter):
+                raise RuntimeError(f"Could not link queue for {receiver_id}")
+
+            sink_pad = webrtcbin.request_pad_simple("sink_%u")
+            tee_pad = self.rtp_tee.request_pad_simple("src_%u")
+            if not sink_pad or not tee_pad:
+                raise RuntimeError(f"Could not request branch pads for {receiver_id}")
+            if tee_pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError(f"Could not link RTP tee for {receiver_id}")
+            if capsfilter.get_static_pad("src").link(sink_pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError(f"Could not link WebRTC sink for {receiver_id}")
+        except Exception:
+            if tee_pad:
+                tee_pad.unlink(queue.get_static_pad("sink"))
+                self.rtp_tee.release_request_pad(tee_pad)
+            if sink_pad and capsfilter.get_static_pad("src").is_linked():
+                capsfilter.get_static_pad("src").unlink(sink_pad)
+            for element in reversed(added_elements):
+                element.set_state(Gst.State.NULL)
+                self.pipeline.remove(element)
+            raise
+
+        self.receiver_branches[receiver_id] = {
+            "queue": queue,
+            "capsfilter": capsfilter,
+            "webrtcbin": webrtcbin,
+            "tee_pad": tee_pad,
+            "sink_pad": sink_pad,
+        }
+        for element in (queue, capsfilter, webrtcbin):
+            element.sync_state_with_parent()
+        logger.info(f"Added WebRTC branch for receiver {receiver_id}")
+        return webrtcbin
+
+    def remove_receiver_branch(self, receiver_id: str):
+        """Remove only one receiver branch without stopping the encoder."""
+        branch = self.receiver_branches.pop(receiver_id, None)
+        if not branch:
+            return
+
+        branch["tee_pad"].unlink(branch["queue"].get_static_pad("sink"))
+        self.rtp_tee.release_request_pad(branch["tee_pad"])
+        branch["capsfilter"].get_static_pad("src").unlink(branch["sink_pad"])
+        for element in (branch["webrtcbin"], branch["capsfilter"], branch["queue"]):
+            element.set_state(Gst.State.NULL)
+            self.pipeline.remove(element)
+        logger.info(f"Removed WebRTC branch for receiver {receiver_id}")
+
+    def _log_webrtcbin_pads(self, stream_id: str):
+        """Log all receiver WebRTC pads for this stream."""
+        for receiver_id, branch in self.receiver_branches.items():
+            pads = []
+            it = branch["webrtcbin"].iterate_pads()
+            while True:
+                ok, pad = it.next()
+                if ok != Gst.IteratorResult.OK:
+                    break
+                caps = pad.get_current_caps()
+                caps_str = caps.to_string() if caps else "no-caps"
+                pads.append(f"{pad.get_name()}({pad.get_direction()}): {caps_str}")
+
+            if pads:
+                logger.info(f"  webrtcbin {receiver_id} pads: {pads}")
+            else:
+                logger.warning(f"  webrtcbin {receiver_id} has NO pads")
 
     def _on_bus_error(self, bus, msg, stream_id):
         err, debug = msg.parse_error()

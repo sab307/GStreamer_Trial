@@ -199,6 +199,7 @@ class WebRTCManager {
             this._send({
                 type: 'answer',
                 stream_id: streamId,
+                receiver_id: this._receiverId,
                 sender_id: senderId,
                 sdp: answer.sdp,
             });
@@ -249,6 +250,7 @@ class WebRTCManager {
                 this._send({
                     type: 'ice_candidate',
                     stream_id: streamId,
+                    receiver_id: this._receiverId,
                     sender_id: senderId,
                     candidate: event.candidate.candidate,
                     sdpMLineIndex: event.candidate.sdpMLineIndex,
