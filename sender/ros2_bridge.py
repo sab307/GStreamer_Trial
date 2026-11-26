@@ -82,6 +82,7 @@ class ROS2CameraBridge:
     def _on_image(self, msg, topic: str):
         """Handle incoming ROS2 Image message."""
         capture_ts = time.monotonic_ns()
+        self._jitter_probe_begin(msg, topic, capture_ts)
 
         try:
             # Always use manual numpy conversion — cv_bridge is unreliable
@@ -118,6 +119,42 @@ class ROS2CameraBridge:
 
         except Exception as e:
             logger.error(f"Error processing image from {topic}: {e}")
+        finally:
+            self._jitter_probe_end(topic)
+
+    # ---- TEMP DEBUG: frame-arrival jitter (remove after diagnosis) ----
+    def _jitter_probe_begin(self, msg, topic: str, now_ns: int):
+        try:
+            st = self.__dict__.setdefault("_jit", {})
+            d = st.setdefault(topic, {"last": None, "gaps": [], "ages": [], "cb": [],
+                                      "t0": None})
+            if d["last"] is not None:
+                d["gaps"].append((now_ns - d["last"]) / 1e6)
+            d["last"] = now_ns
+            d["t0"] = now_ns
+            ros_now = self._node.get_clock().now().nanoseconds
+            stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            d["ages"].append((ros_now - stamp) / 1e6)
+        except Exception:
+            pass
+
+    def _jitter_probe_end(self, topic: str):
+        try:
+            d = self._jit[topic]
+            d["cb"].append((time.monotonic_ns() - d["t0"]) / 1e6)
+            if len(d["gaps"]) >= 90:
+                g, a, c = d["gaps"], d["ages"], d["cb"]
+                n = len(g)
+                mean = sum(g) / n
+                sd = (sum((x - mean) ** 2 for x in g) / n) ** 0.5
+                logger.info(
+                    f"[JITTER] {topic}: gap mean={mean:.0f}ms sd={sd:.0f}ms "
+                    f"max={max(g):.0f}ms back-to-back(<8ms)={sum(1 for x in g if x < 8)}/{n} | "
+                    f"age(stamp->cb) mean={sum(a)/len(a):.0f}ms max={max(a):.0f}ms | "
+                    f"callback mean={sum(c)/len(c):.1f}ms max={max(c):.0f}ms")
+                d["gaps"], d["ages"], d["cb"] = [], [], []
+        except Exception:
+            pass
 
     def _start_simulated(self):
         """Start simulated camera feeds for testing without ROS2."""

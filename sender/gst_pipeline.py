@@ -405,6 +405,19 @@ class GstPipelineBuilder:
                 logger.warning(f"Push buffer returned {ret} "
                                f"(frame={self._frame_counter}, pts={running_pts}ns)")
 
+        # TEMP DEBUG: appsrc backlog (remove after diagnosis)
+        if self._frame_counter % self.fps == 0:
+            try:
+                lvl_bytes = self.appsrc.get_property("current-level-bytes")
+                try:
+                    lvl_bufs = self.appsrc.get_property("current-level-buffers")
+                except TypeError:
+                    lvl_bufs = -1
+                logger.info(f"[APPSRC-BACKLOG] {self.stream_id}: "
+                            f"{lvl_bufs} buffers, {lvl_bytes/1e6:.2f} MB queued")
+            except Exception as e:
+                logger.warning(f"[APPSRC-BACKLOG] read failed: {e}")
+
         # Periodic status
         if self._frame_counter % 300 == 0:
             logger.info(f"[FRAMES] pushed={self._frame_counter}, "

@@ -99,7 +99,7 @@ class WebRTCSender:
         logger.info(f"Connecting to signaling server: {uri}")
 
         try:
-            self.ws = await websockets.connect(uri, ping_interval=5, ping_timeout=10)
+            self.ws = await websockets.connect(uri, ping_interval=10, ping_timeout=30)
             self._connected = True
             logger.info("Connected to signaling server")
 
