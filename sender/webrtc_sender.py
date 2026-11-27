@@ -287,6 +287,9 @@ class WebRTCSender:
         sdp_text = offer.sdp.as_text()
         candidate_count = sdp_text.count('a=candidate:')
         logger.info(f"Sending offer for {stream_id} ({candidate_count} candidates in SDP)")
+        fb_lines = [l.strip() for l in sdp_text.splitlines()
+                    if l.startswith(('a=rtcp-fb', 'a=rtpmap'))]
+        logger.info(f"[SDP] {stream_id} offer feedback: {fb_lines}")
 
         msg = json.dumps({
             "type": "offer",

@@ -24,7 +24,7 @@ CODEC_CONFIG = {
             "deadline": 1,          # realtime
             "cpu-used": 8,          # fastest encoding
             "target-bitrate": 2000000,
-            "keyframe-max-dist": 60,
+            "keyframe-max-dist": 30,
         },
         "payloader": "rtpvp8pay",
         "encoding_name": "VP8",
@@ -37,7 +37,7 @@ CODEC_CONFIG = {
             "deadline": 1,
             "cpu-used": 8,
             "target-bitrate": 2000000,
-            "keyframe-max-dist": 60,
+            "keyframe-max-dist": 30,
         },
         "payloader": "rtpvp9pay",
         "encoding_name": "VP9",
@@ -50,7 +50,7 @@ CODEC_CONFIG = {
             "tune": 4,             # zerolatency
             "speed-preset": 1,     # ultrafast
             "bitrate": 2000,
-            "key-int-max": 60,
+            "key-int-max": 30,
         },
         "payloader": "rtph264pay",
         "payloader_props": {
@@ -67,7 +67,7 @@ CODEC_CONFIG = {
             "tune": 4,
             "speed-preset": 1,
             "bitrate": 2000,
-            "key-int-max": 60,
+            "key-int-max": 30,
         },
         "payloader": "rtph265pay",
         "payloader_props": {
@@ -259,15 +259,38 @@ class GstPipelineBuilder:
         if not queue or not capsfilter or not webrtcbin:
             raise RuntimeError(f"Could not create WebRTC branch for {receiver_id}")
 
-        queue.set_property("max-size-buffers", 30)
+        # Limits are OR'd (whichever is hit first). The queue sits before
+        # webrtcbin, so packets it drops cannot be recovered by NACK.
+        #  - max-size-time bounds staleness: a stalled peer can never hold
+        #    more than ~200 ms of old video (all packets of a frame share one
+        #    timestamp, so a keyframe burst still fits).
+        #  - max-size-buffers is a safety cap on packet count so a huge burst
+        #    cannot grow the queue without bound.
+        queue.set_property("max-size-buffers", 150)
         queue.set_property("max-size-bytes", 0)
-        queue.set_property("max-size-time", 0)
+        queue.set_property("max-size-time", 200 * Gst.MSECOND)
         queue.set_property("leaky", 2)  # downstream: discard old frames for slow peers
+        # Count queue overruns (each one = packets dropped by the leaky queue).
+        overrun_state = {"count": 0, "last_log": 0.0}
+
+        def on_overrun(_queue, rid=receiver_id, state=overrun_state):
+            state["count"] += 1
+            now = time.monotonic()
+            if now - state["last_log"] >= 1.0:
+                state["last_log"] = now
+                logger.warning(f"[QUEUE] {self.stream_id}/{rid}: overrun, "
+                               f"packets dropped (overruns so far: {state['count']})")
+
+        queue.connect("overrun", on_overrun)
         capsfilter.set_property("caps", Gst.Caps.from_string(
             "application/x-rtp,media=video,"
             f"encoding-name={self.config['encoding_name']},"
             f"payload={self.config['payload_type']},"
-            f"clock-rate={self.config['clock_rate']}"
+            f"clock-rate={self.config['clock_rate']},"
+            # Advertise loss-recovery feedback so the browser can send NACK
+            # (retransmit) and PLI/FIR (keyframe) requests instead of freezing
+            # until the next periodic keyframe.
+            "rtcp-fb-nack=true,rtcp-fb-nack-pli=true,rtcp-fb-ccm-fir=true"
         ))
         webrtcbin.set_property("bundle-policy", "max-bundle")
 
@@ -289,6 +312,11 @@ class GstPipelineBuilder:
                 raise RuntimeError(f"Could not link RTP tee for {receiver_id}")
             if capsfilter.get_static_pad("src").link(sink_pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError(f"Could not link WebRTC sink for {receiver_id}")
+            # do-nack defaults to FALSE: without it webrtcbin keeps no
+            # retransmit history and ignores NACKs.
+            transceiver = sink_pad.get_property("transceiver")
+            if transceiver is not None:
+                transceiver.set_property("do-nack", True)
         except Exception:
             if tee_pad:
                 tee_pad.unlink(queue.get_static_pad("sink"))
